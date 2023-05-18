@@ -1,7 +1,8 @@
 import os
+import time
+from utils.meter import AverageValueMeter
 
-from tqdm import tqdm
-from PIL import Image
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,11 +10,18 @@ import torchvision.models as models
 import torch.optim as optim
 import torchvision.transforms as transforms
 import segmentation_models_pytorch as smp
+import torch.nn.functional as F
+from torch.profiler import profile, record_function, ProfilerActivity
+
 from segmentation_models_pytorch import utils as smp_utils
 from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
-from torchvision.models import VGG16_Weights
+from tqdm import tqdm
+from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
+from torch.backends import cudnn
+
+writer = SummaryWriter()
+cudnn.benchmark = True # fast training
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -68,7 +76,8 @@ class DepthDataset(Dataset):
         mask = torch.where(mask!=0,self.lambd,1-self.lambd)
 
         # Load RGB image
-        rgb_image = Image.open(rgb_path).convert('RGB')
+        rgb_image = np.array(Image.open(rgb_path).convert('RGB'))
+        
         depth_image = Image.open(depth_path)
         pseudo_depth = Image.open(pseudo_depth_path)
         if self.transform:
@@ -87,31 +96,54 @@ class DepthDataset(Dataset):
         ground_truth_depth = torch.cat((ground_truth_depth, mask), dim=0)
         return input_tensor, ground_truth_depth
 
-def train(train_epoch, val_epoch, train_loader, valid_loader, num_epochs, run_name, save_period=10):
-    
-    writer = SummaryWriter(comment=run_name)
+# TODO: check train sanity
+def train(model, train_loader, valid_loader, num_epochs, run_name, optimizer, loss_fun, save_period=10):
+    model.to(device)
     min_val_loss = float('inf')
     
-    # train_logs_list, valid_logs_list = [], []
     for epoch in range(num_epochs):
-        print('\nEpoch: {}'.format(epoch))
-        train_logs = train_epoch.run(train_loader)
-        # print(train_logs)
-        valid_logs = valid_epoch.run(valid_loader)
-        # train_logs_list.append(train_logs)
-        # valid_logs_list.append(valid_logs)
-    
-        # log tensorboard
-        writer.add_scalar('Loss/train', train_logs['maskmse_loss'], epoch)
-        writer.add_scalar('Loss/val', valid_logs['maskmse_loss'], epoch)
-        
-        # Save model if a better loss is obtained
-        if min_val_loss > valid_logs['maskmse_loss']:
-            min_val_loss = valid_logs['maskmse_loss']
-            torch.save(model, f'./checkpoint/{run_name}/best_model.pth')
-            print('Model saved!')
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+                dloader = train_loader
+            else:
+                model.eval()   # Set model to evaluate mode
+                dloader = valid_loader
+            # logging
+            logs = {}
+            loss_meter = AverageValueMeter()
             
-    writer.close()
+            start = time.time()
+            with tqdm(dloader, desc = phase) as iterator:
+                for input, target in iterator:
+                    print(phase + ' dataloader time:', time.time() - start)
+                    start = time.time()
+                    input, target = input.to(device), target.to(device)
+                    print(phase+' to(cuda) time:', time.time()-start)
+                    start = time.time()
+                    optimizer.zero_grad()
+                    with torch.set_grad_enabled(phase == 'train'):
+                        prediction = model.forward(input)
+                        loss = loss_fun(prediction, target) 
+                        if phase == 'train':
+                            loss.backward()
+                            optimizer.step()
+                        print(phase+' train 1 batch time: ', time.time()-start)
+
+                        # update loss logs
+                        loss_value = loss.cpu().detach().numpy()
+                        loss_meter.add(loss_value)
+                        loss_logs = {loss_fun.__name__: loss_meter.mean}
+                        logs.update(loss_logs)
+
+            loss_name = 'Loss/' + phase
+            writer.add_scalar(loss_name, logs['maskmse_loss'], epoch)
+            writer.flush()
+
+            if phase == 'train' and min_val_loss > logs['maskmse_loss']:
+                min_val_loss = logs['maskmse_loss']
+                torch.save(model, f'./checkpoint/{run_name}/best_model.pth')
+                print('Model saved!')
             
 
 def test():
@@ -124,7 +156,7 @@ if __name__ == '__main__':
     # TODO: add argparser: run_name(check_point save folder), train/test
     # DONE: 可以用192*256, 好跑大点的batchsize, check what size does zoe has as default
     # DONE: The problem of using masked label is there are so many frames that does not contain the object so explore other loss or write a custom loss
-    # LOG: bs:64,pin_mem=false,num_worker=8 : 1 train epoch(4067 iter):124min, cpu mem: 16G, cpu usage low, gpu mem 7161 gpu usage low
+    # LOG: bs:64,pin_mem=false,num_worker=8 : 1 train epoch(4067 iter):124min, cpu mem: 4G, cpu usage low, gpu mem 7161 gpu usage low
     
     run_name = '30scene_ori_Epoch200_MaskedMSEloss_lambda8'
     path = f'./checkpoint/{run_name}'
@@ -137,11 +169,11 @@ if __name__ == '__main__':
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     target_transform = transforms.Compose([
-        transforms.PILToTensor(),
+        transforms.PILToTensor(), # using PILToTensor() to load zoe depth unscaled
         transforms.Lambda(lambda t: t/255.*10.)  # Scale habitatDyn depth pixel values to depth in meters
     ])
     pseudo_depth_transform = transforms.Compose([
-        transforms.PILToTensor(),
+        transforms.PILToTensor(),# using PILToTensor() to load HabitatDyn depth unscaled
         transforms.Resize(192),
         transforms.Lambda(lambda t: t/256.)  # Scale pseudo depth pixel values to depth in meters
     ])
@@ -153,33 +185,27 @@ if __name__ == '__main__':
     # use a last 20 scenes of total 30 for training
     total_frames = len(train_dataset)
     frames_for_earch_scene = 13014
+    frames_for_earch_scene = 10
     last_n_scenes = 20
     sub_train_dataset = torch.utils.data.Subset(train_dataset, range(total_frames-frames_for_earch_scene*last_n_scenes, total_frames))
-    train_dataloader = DataLoader(sub_train_dataset, batch_size=64, shuffle=True, pin_memory=False, num_workers=8)
+    train_dataloader = DataLoader(sub_train_dataset, batch_size=64, shuffle=True, pin_memory=True, num_workers=4,prefetch_factor=2)
     
     valid_dataset = DepthDataset(data_dir=test_data_dir, split='', transform=transform, target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform)
     # only use a subset of test_dataset to eval
-    # sub_valid_dataset = torch.utils.data.Subset(valid_dataset, range(0, 256))
-    valid_dataloader = DataLoader(valid_dataset, batch_size=64, shuffle=False, pin_memory=False, num_workers=8)
-    
-    ENCODER = 'resnet18'
-    ENCODER_WEIGHTS = 'imagenet'
-    CLASSES = ["all_depth"]
-    # need modify segmentation_models_pytorch to add ReLU activation
-    ACTIVATION = 'ReLU' # could be None for logits or 'softmax2d' for multiclass segmentation
+    sub_valid_dataset = torch.utils.data.Subset(valid_dataset, range(0, 32))
+    valid_dataloader = DataLoader(valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=4)
+    valid_dataloader = DataLoader(sub_valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=4)
     
     # define loss function
-    # loss = smp.utils.losses.DiceLoss()
-    # loss = smp_utils.losses.MSELoss()
     loss = MaskedMSELoss()
-        
     # create segmentation model with pretrained encoder
+    CLASSES = ["all_depth"]
     model = smp.Unet(
-        encoder_name=ENCODER, 
-        encoder_weights=ENCODER_WEIGHTS, 
+        encoder_name='resnet18', 
+        encoder_weights='imagenet', 
         in_channels=4,
         classes=len(CLASSES), 
-        activation=ACTIVATION,
+        activation='ReLU', # could be None for logits or 'softmax2d' for multiclass segmentation
     )
     
     # define optimizer
@@ -192,27 +218,11 @@ if __name__ == '__main__':
         optimizer, T_0=1, T_mult=2, eta_min=5e-5,
     )    
     
-    train_epoch = smp_utils.train.TrainEpoch(
-        model, 
-        loss=loss, 
-        metrics=[],
-        optimizer=optimizer,
-        device=device,
-        verbose=True,
-    )
-    
-    valid_epoch = smp_utils.train.ValidEpoch(
-        model, 
-        loss=loss, 
-        metrics=[],
-        device=device,
-        verbose=True,
-    )
-
-    train(train_epoch, valid_epoch, train_dataloader, valid_dataloader, 200, run_name)
+    train(model, train_dataloader, valid_dataloader, 2, run_name, optimizer, loss)
     
     # # load best saved model checkpoint from the current run
     # if os.path.exists('./checkpoint/best_model.pth'):
     #     best_model = torch.load('./checkpoint/best_model.pth', map_location=DEVICE)
     #     print('Loaded UNet model from this run.')
         
+    writer = SummaryWriter()
