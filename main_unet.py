@@ -47,54 +47,55 @@ class DepthDataset(Dataset):
         self.transform = transform
         self.target_transform = target_transform
         self.pseudo_depth_transform = pseudo_depth_transform
-        self.scene_names = sorted(os.listdir(os.path.join(data_dir, split, 'habitat_sim_DAVIS/JPEGImages/480p')))
+        self.scene_names = sorted(os.listdir(os.path.join(data_dir, split, 'habitat_sim_DAVIS/JPEGImages/480p'))) # 1 video per folder
         self.data = []
 
-        for scene_name in self.scene_names:
+        print(len(self.scene_names))
+        for scene_name in self.scene_names[:27]:
             rgb_folder = os.path.join(data_dir, split, 'habitat_sim_DAVIS/JPEGImages/480p', scene_name)
             depth_folder = os.path.join(data_dir, split, 'habitat_sim_DAVIS/Annotations/480p_depth', scene_name)
             mask_folder = os.path.join(data_dir, split, 'habitat_sim_DAVIS/Annotations/480p_objectID', scene_name)
             pseudo_depth_folder = os.path.join(data_dir, split, 'zoe_depth_raw', scene_name)
+            # prepare one scene time
+            start = time.time()
             for filename in os.listdir(rgb_folder):
                 if filename.endswith('.png') or filename.endswith('.jpg'):
                     rgb_path = os.path.join(rgb_folder, filename)
                     depth_path = os.path.join(depth_folder, filename[:-4]+'.png')
                     pseudo_depth_path = os.path.join(pseudo_depth_folder, filename[:-4]+'.png')
                     mask_path = os.path.join(mask_folder, filename[:-4]+'.png')
-                    self.data.append((rgb_path, depth_path, pseudo_depth_path, mask_path))
+                    
+                    # load to mmemory at first to imporve IO during training
+                    # load mask
+                    mask = torch.from_numpy(np.array(Image.open(mask_path).copy())).type(torch.bool).unsqueeze(0).to(device)
+                    mask = torch.where(mask!=0,self.lambd,1-self.lambd)
+                    
+                    # Load RGB image
+                    rgb_image = np.array(Image.open(rgb_path).convert('RGB').copy())
+                    depth_image = Image.open(depth_path).copy()
+                    pseudo_depth = Image.open(pseudo_depth_path).copy()
+                    if self.transform:
+                        rgb_image = self.transform(rgb_image)
+                    if self.target_transform:
+                        depth_image = self.target_transform(depth_image)
+                    if self.pseudo_depth_transform:
+                        pseudo_depth = self.pseudo_depth_transform(pseudo_depth)
+                    
+                    # Combine RGB and depth maps into a single input tensor
+                    # rgb_image = rgb_image.to(device)
+                    input_tensor = torch.cat((rgb_image, pseudo_depth), dim=0) # type: ignore
+                    # input_tensor = input_tensor.to(device)
+                    
+                    # Load depth maps
+                    ground_truth_depth = torch.cat((depth_image, mask), dim=0)
+                    self.data.append((input_tensor, ground_truth_depth))
+            print("time to prepare one folder: ", time.time()-start)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        rgb_path, depth_path, pseudo_depth_path, mask_path = self.data[index]
-        # TODO write more compact transform: like use from torchvision.io import read_image, but with caution 0 255
-        
-        # load mask
-        mask = torch.from_numpy(np.array(Image.open(mask_path))).type(torch.bool).unsqueeze(0)
-        # mask.to(device)
-        mask = torch.where(mask!=0,self.lambd,1-self.lambd)
-
-        # Load RGB image
-        rgb_image = np.array(Image.open(rgb_path).convert('RGB'))
-        
-        depth_image = Image.open(depth_path)
-        pseudo_depth = Image.open(pseudo_depth_path)
-        if self.transform:
-            rgb_image = self.transform(rgb_image)
-        if self.target_transform:
-            ground_truth_depth = self.target_transform(depth_image)
-        if self.pseudo_depth_transform:
-            pseudo_depth = self.pseudo_depth_transform(pseudo_depth)
-
-        # Combine RGB and depth maps into a single input tensor
-        # rgb_image = rgb_image.to(device)
-        input_tensor = torch.cat((rgb_image, pseudo_depth), dim=0) # type: ignore
-        # input_tensor = input_tensor.to(device)
-        
-        # Load depth maps
-        ground_truth_depth = torch.cat((ground_truth_depth, mask), dim=0)
-        return input_tensor, ground_truth_depth
+        return self.data[index]
 
 # TODO: check train sanity
 def train(model, train_loader, valid_loader, num_epochs, run_name, optimizer, loss_fun, save_period=10):
@@ -114,6 +115,9 @@ def train(model, train_loader, valid_loader, num_epochs, run_name, optimizer, lo
             loss_meter = AverageValueMeter()
             
             start = time.time()
+            # TODO delete
+            if dloader == None:
+                continue
             with tqdm(dloader, desc = phase) as iterator:
                 for input, target in iterator:
                     print(phase + ' dataloader time:', time.time() - start)
@@ -165,15 +169,18 @@ if __name__ == '__main__':
     
     transform = transforms.Compose([
         transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.to(device)),
         transforms.Resize(192),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     target_transform = transforms.Compose([
         transforms.PILToTensor(), # using PILToTensor() to load zoe depth unscaled
+        transforms.Lambda(lambda x: x.to(device)),
         transforms.Lambda(lambda t: t/255.*10.)  # Scale habitatDyn depth pixel values to depth in meters
     ])
     pseudo_depth_transform = transforms.Compose([
         transforms.PILToTensor(),# using PILToTensor() to load HabitatDyn depth unscaled
+        transforms.Lambda(lambda x: x.to(device)),
         transforms.Resize(192),
         transforms.Lambda(lambda t: t/256.)  # Scale pseudo depth pixel values to depth in meters
     ])
@@ -181,20 +188,22 @@ if __name__ == '__main__':
     train_data_dir = '/home/gao/dev/project_remote/Habitat-sim-ext/randomwalk/output/habitat_sim_excl_static_30scenes_newPitch_originalModel'
     test_data_dir = '/home/gao/dev/project_remote/Habitat-sim-ext/randomwalk/output/habitat_sim_excl_static_2scenes_newPitch_3diffModel'
     
+    start = time.time()
     train_dataset = DepthDataset(data_dir=train_data_dir, split='', transform=transform, target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform)
+    print("train dataset of x scenes creatation time", time.time()-start)
     # use a last 20 scenes of total 30 for training
     total_frames = len(train_dataset)
-    frames_for_earch_scene = 13014
-    frames_for_earch_scene = 10
-    last_n_scenes = 20
-    sub_train_dataset = torch.utils.data.Subset(train_dataset, range(total_frames-frames_for_earch_scene*last_n_scenes, total_frames))
-    train_dataloader = DataLoader(sub_train_dataset, batch_size=64, shuffle=True, pin_memory=True, num_workers=4,prefetch_factor=2)
+    frames_for_earch_scene = 13014 # 53 videos
+    frames_for_earch_scene = 10 # 53 videos
+    last_n_scenes = 10
+    sub_train_dataset = torch.utils.data.Subset(train_dataset, range(total_frames-frames_for_earch_scene*last_n_scenes, total_frames)) # type: ignore
+    train_dataloader = DataLoader(sub_train_dataset, batch_size=64, shuffle=True, pin_memory=False, num_workers=4,prefetch_factor=2)
     
-    valid_dataset = DepthDataset(data_dir=test_data_dir, split='', transform=transform, target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform)
-    # only use a subset of test_dataset to eval
-    sub_valid_dataset = torch.utils.data.Subset(valid_dataset, range(0, 32))
-    valid_dataloader = DataLoader(valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=4)
-    valid_dataloader = DataLoader(sub_valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=4)
+    # valid_dataset = DepthDataset(data_dir=test_data_dir, split='', transform=transform, target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform)
+    # # only use a subset of test_dataset to eval
+    # sub_valid_dataset = torch.utils.data.Subset(valid_dataset, range(0, 32)) # type: ignore
+    # valid_dataloader = DataLoader(valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=8)
+    # valid_dataloader = DataLoader(sub_valid_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=8)
     
     # define loss function
     loss = MaskedMSELoss()
@@ -218,7 +227,8 @@ if __name__ == '__main__':
         optimizer, T_0=1, T_mult=2, eta_min=5e-5,
     )    
     
-    train(model, train_dataloader, valid_dataloader, 2, run_name, optimizer, loss)
+    # train(model, train_dataloader, valid_dataloader, 2, run_name, optimizer, loss)
+    train(model, train_dataloader, None, 2, run_name, optimizer, loss)
     
     # # load best saved model checkpoint from the current run
     # if os.path.exists('./checkpoint/best_model.pth'):
