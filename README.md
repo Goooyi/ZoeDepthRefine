@@ -39,7 +39,7 @@ Observe lsage around 35% for all thread, GPU usage peak to 99% but only for a sh
 2. I’ve seen big gains over torch.DataParallel using apex.DistributedDataParallel. Moving from ‘one main process + worker process + multiple-GPU with DataParallel’ to 'one process-per GPU with apex (and presumably torch)
 DistributedDataParallel has always improved performance for me. Remember to (down)scale your worker processes per training process accordingly. Higher GPU utilization and less waiting for synchronization usually results, the variance in batch times will reduce with the average time moving closer to the peak.
 
-- [ ] write a custom streaming data loader class that reads data from a file.
+- [ ] write a custom streaming data loader class that reads data from a file. vs Dr.shen method
 - [ ] multi-treading vs Distributed(multi-server) vs Data Parallel(multi-gpu) vs multi-gpu(https://pytorch.org/docs/stable/notes/multiprocessing.htm)
 - [ ] voom voom repo
 - [ ] set `x.cuda(non_blocking=True)` [if pin_memory = True](https://stackoverflow.com/questions/55563376/pytorch-how-does-pin-memory-work-in-dataloader)
