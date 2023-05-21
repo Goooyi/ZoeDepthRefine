@@ -30,7 +30,7 @@ dataloader time: 2.9199090003967285
 memory to cuda time: 0.03172612190246582 
 train train 1 batch time:  0.08431768417358398 
 ```
-Observe lsage around 35% for all thread, GPU usage peak to 99% but only for a shortcut cause the datalloding bottleneck
+Observe lsage around 35% for all thread, GPU usage peak to 99% but only for a short period cause the datalloding bottleneck
 
 
 ## Solutions
@@ -73,3 +73,5 @@ for epoch in tqdm(range(1000),desc="EPOCH", position=0):
 - [x] Use LRU Cache if same data is used in batches because of data augmentation, etc.
 - [x] Use Image.open(...).cpoy(): otherwise the server willdown cause it will not close the Image object, .copy() will dereference ImageFile object, call destructor 
 - [ ] when set `shuffle=True` and `sampler is None` in Dataloader, the RandomSampler is shuffle without replacement as default which make the model harder to train as the model receive total different data in each batch, but commonly make the final model perform better.
+- [ ] random resized crop to the dimension of 224x224
+- [ ] Dataset batched sampling
