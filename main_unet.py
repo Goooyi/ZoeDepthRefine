@@ -1,4 +1,5 @@
 import os
+import argparse
 
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -6,22 +7,28 @@ import torch
 import torchvision.transforms as transforms
 from torch.backends import cudnn
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 from torch.utils.tensorboard import SummaryWriter #type: ignore
 from tqdm import tqdm
 
 from HabitatDyndataset.dataset import *
 from utils.batch_transform import PILToTensor as bt_PILToTensor
 from utils.batch_transform import ToTensor as bt_ToTensor
-from utils.custome_loss import MaskedMSELoss, MaskedMSELoss_resized
+from utils.custome_loss import *
 from utils.dataloader import HabitatDynStreamLoader
 from utils.meter import AverageValueMeter
 
-import ray
-from ray import air, tune
 from ray.air import Checkpoint, session
-from ray.tune.schedulers import ASHAScheduler
 
 from ray.tune.search.hyperopt import HyperOptSearch
+
+parser = argparse.ArgumentParser(description='PyTorch zoeRefine')
+parser.add_argument('--test_data', metavar='DIR', default=None,
+                    help='path to test dataset')
+parser.add_argument('--test', default=False,
+                    help='test mode',action='store_true')
+parser.add_argument('--checkpoint', default=None,
+                    help='path to checkpoint')
 
 cudnn.benchmark = True  # fast training
 # TODO: move np seed to DepthDataset_preload since random sample there
@@ -34,7 +41,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # TODO: pass parameters like transform using **
 # TODO: transfer stream dataloader structure to dataset
 def train(config, model, train_data_dir, valid_dataloader, num_epochs, run_name, transform, target_transform, pseudo_depth_transform, mask_transform):
-# def train(params={}):
     min_metric_loss = float('inf')
     metric = MaskedMSELoss(1.0, "movingObject_MSE")
     mname = metric.name if metric.name else ''
@@ -43,17 +49,8 @@ def train(config, model, train_data_dir, valid_dataloader, num_epochs, run_name,
        dict(params=model.parameters(), lr=config["lr"]),
     ])
 
-    checkpoint = session.get_checkpoint()
 
-    if checkpoint:
-        checkpoint_state = checkpoint.to_dict()
-        start_epoch = checkpoint_state["epoch"]
-        model.load_state_dict(checkpoint_state["net_state_dict"])
-        optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
-    else:
-        start_epoch = 0
-
-    for epoch in tqdm(range(start_epoch, num_epochs)):
+    for epoch in tqdm(range(num_epochs)):
         if epoch % 5 == 0:
             print(f'change the scenes\n')
             train_dataset = DepthDataset_preload(data_dir=train_data_dir, split='', transform=transform, target_transform=target_transform,
@@ -111,22 +108,49 @@ def train(config, model, train_data_dir, valid_dataloader, num_epochs, run_name,
             torch.save(model, f'./checkpoint/{run_name}/best_model.pth')
             print('Model saved!')
 
-        checkpoint_data = {
-            "epoch": epoch,
-            "net_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }
-        checkpoint = Checkpoint.from_dict(checkpoint_data)
 
-        session.report(
-            {"object_val_loss": metrics['val: ' + mname]},
-            checkpoint=checkpoint,
-        )
+def test(model, data_dir, transform, target_transform, pseudo_depth_transform, mask_transform):
+    model.eval()
+    model.to(device)
 
+    MaskedMSE = MaskedMSELoss(1.0, "movingObject_MSE")
+    MaskedMAE = MaskedMAELoss(1.0, "movingObject_MAE")
+    MaskedMSR = MaskedMSRLoss(1.0, "movingObject_MSR")
+    MaskedRMSE = MaskedRMSELoss(1.0, "movingObject_RMSE")
+    MaskedRMSLE = MaskedRMSLELoss(1.0, "movingObject_RMSLE")
 
+    MaskedMSELoss_meter = AverageValueMeter()
+    MaskedMAELoss_meter = AverageValueMeter()
+    MaskedMSRLoss_meter = AverageValueMeter()
+    MaskedRMSELoss_meter = AverageValueMeter()
+    MaskedRMSLELoss_meter = AverageValueMeter()
 
-def test():
-    pass
+    test_dataset = DepthDataset(data_dir=data_dir, device=device, split='', transform=transform, target_transform=target_transform,
+                    pseudo_depth_transform=pseudo_depth_transform, mask_transform=mask_transform )
+    # take a subset of only 1/6 of the data
+    sub_test_dataset = Subset(test_dataset, range(0, len(test_dataset)//6) )
+    # sub_test_dataset = Subset(test_dataset, range(0, 256))
+
+    test_loader = DataLoader(
+        sub_test_dataset, batch_size=64, shuffle=False, pin_memory=True, num_workers=16, prefetch_factor=2)
+
+    for input_tensor, ground_truth_detph in tqdm(test_loader):
+        input_tensor, ground_truth_detph = input_tensor.to(device), ground_truth_detph.to(device)
+
+        prediction = model.forward(input_tensor)
+
+        MaskedMSELoss_meter.add(MaskedMSE(prediction, ground_truth_detph).cpu().detach().numpy())
+        MaskedMAELoss_meter.add(MaskedMAE(prediction, ground_truth_detph).cpu().detach().numpy())
+        MaskedMSRLoss_meter.add(MaskedMSR(prediction, ground_truth_detph).cpu().detach().numpy())
+        MaskedRMSELoss_meter.add(MaskedRMSE(prediction, ground_truth_detph).cpu().detach().numpy())
+        MaskedRMSLELoss_meter.add(MaskedRMSLE(prediction, ground_truth_detph).cpu().detach().numpy())
+
+    print("Eval Results")
+    print(f"MaskedMSELoss: {MaskedMSELoss_meter.mean}")
+    print(f"MaskedMAELoss: {MaskedMAELoss_meter.mean}")
+    print(f"MaskedMSRLoss: {MaskedMSRLoss_meter.mean}")
+    print(f"MaskedRMSELoss: {MaskedRMSELoss_meter.mean}")
+    print(f"MaskedRMSLELoss: {MaskedRMSLELoss_meter.mean}")
 
 
 if __name__ == '__main__':
@@ -136,15 +160,6 @@ if __name__ == '__main__':
     # DONE: 可以用192*256, 好跑大点的batchsize, check what size does zoe has as default
     # DONE: The problem of using masked label is there are so many frames that does not contain the object so explore other loss or write a custom loss
     # LOG: bs:64,pin_mem=false,num_worker=8 : 1 train epoch(4067 iter):124min, cpu mem: 4G, cpu usage low, gpu mem 7161 gpu usage low
-
-    run_name = '30scene_ori_Epoch1000_MaskedMSEloss_lambda6_worker8_cosAneal12'
-
-    
-
-    path = f'./checkpoint/{run_name}'
-    if not os.path.exists(path):
-        os.makedirs(path)
-
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Resize(192),
@@ -166,9 +181,35 @@ if __name__ == '__main__':
         transforms.Resize(192)
     ])
 
+    args = parser.parse_args()
+
+    if args.test:
+        if not args.test_data:
+            test_data = '/home/gao/dev/project_remote/Habitat-sim-ext/randomwalk/output/habitat_sim_excl_static_30scenes_newPitch_originalModel'
+            print("test_data: {}".format(test_data))
+        else:
+            test_data = args.test_data
+
+        if not args.checkpoint:
+            raise ValueError("checkpoint not given")
+        else:
+            print("checkpoint: {}".format(args.checkpoint))
+
+        model = torch.load(args.checkpoint)
+
+        test(model, test_data, transform, target_transform, pseudo_depth_transform, mask_transform)
+
+        exit()
+            
+        
+    run_name = '30scene_ori_Epoch1000_MaskedMSEloss_lambda6_worker8_cosAneal12'
+
+    path = f'./checkpoint/{run_name}'
+    if not os.path.exists(path):
+        os.makedirs(path)
+
     train_data_dir = '/home/gao/dev/project_remote/Habitat-sim-ext/randomwalk/output/habitat_sim_excl_static_30scenes_newPitch_originalModel'
     test_data_dir = '/home/gao/dev/project_remote/Habitat-sim-ext/randomwalk/output/habitat_sim_excl_static_2scenes_newPitch_3diffModel'
-
 
     valid_dataset = DepthDataset_preload(data_dir=test_data_dir, split='', transform=transform, target_transform=target_transform,
                                          pseudo_depth_transform=pseudo_depth_transform, mask_transform=mask_transform, device=device, sub_video_count=10)
@@ -200,33 +241,14 @@ if __name__ == '__main__':
     # define optimizer
     # define learning rate scheduler (not used )
     
-    search_space = {
-    "lr": tune.loguniform(8, 1),
-    "lambd": tune.uniform(0.1, 0.9)
-    # "batch_size": tune.choice([16,32,64])
-    }
 
 # train(model, train_data_dir, valid_dataloader, 1000, run_name, optimizer=optimizer, lr_scheduler,transform=transform,
 #           target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform, mask_transform=mask_transform, metric=metric, writer=writer),
 
 
-    tuner = tune.Tuner(
-    tune.with_parameters(train, model=model, train_data_dir=train_data_dir, valid_dataloader=valid_dataloader, num_epochs=500, run_name=run_name, transform=transform,
-          target_transform=target_transform, pseudo_depth_transform=pseudo_depth_transform, mask_transform=mask_transform),
-    run_config=air.RunConfig(local_dir="./ray_results", name="test_experiment"),
-    tune_config=tune.TuneConfig(
-        num_samples=1,
-        max_concurrent_trials = 2,
-        scheduler=ASHAScheduler(metric="object_val_loss", mode="min"),
-    ),
-    param_space=search_space,
-    )
-
-
-    results = tuner.fit()
 
     # Obtain a trial dataframe from all run trials of this `tune.run` call.
-    dfs = {result.log_dir: result.metrics_dataframe for result in results}
+
     # Plot by epoch
     # ax = None  # This plots everything on the same plot
     # for d in dfs.values():

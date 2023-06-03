@@ -98,8 +98,7 @@ class DepthDataset(Dataset):
 		# Load depth maps
 		ground_truth_depth = torch.cat((depth_image, mask), dim=0) # type: ignore
 
-		self.data.append((input_tensor, ground_truth_depth))
-		return self.data[index]
+		return input_tensor, ground_truth_depth
 
 
 # TODO: device not used for now
